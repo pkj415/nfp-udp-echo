@@ -81,4 +81,13 @@ int memzone_free(const struct memzone *mz);
  */
 void memzone_init();
 
+/**
+ * Convert virtual address to physical address.
+ * Hacky solution used by DPDK!
+ *
+ * @note
+ * Refer http://man7.org/linux/man-pages/man5/proc.5.html
+ */
+uint64_t mem_virt2phy(const void* virtaddr);
+
 #endif /* _MEMZONE_H_ */

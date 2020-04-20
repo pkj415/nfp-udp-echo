@@ -48,7 +48,7 @@ static uint16_t _free_mz = MAX_MEMZONES;
  * @note
  * Refer http://man7.org/linux/man-pages/man5/proc.5.html
  */ 
-static uint64_t
+uint64_t
 mem_virt2phy(const void* virtaddr)
 {
     int fd, retval;

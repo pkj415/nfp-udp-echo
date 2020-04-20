@@ -60,6 +60,7 @@ $(eval $(call micro_c.add_fw_libs,rx_obj,nfp pkt std net))
 $(eval $(call micro_c.add_flags,rx_obj,-I$(microc_blocks_dir)/blm))
 $(eval $(call micro_c.add_src_lib,rx_obj,libblm,$(microc_blocks_dir)/blm))
 $(eval $(call micro_c.force_include,rx_obj,config))
+
 #
 # TX Application definition
 #

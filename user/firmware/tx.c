@@ -71,7 +71,7 @@ __volatile __shared __emem uint32_t debug_idx;
                       (debug + (_idx_val % (1024 * 64))), sizeof(_dvals)); \
     } } while(0)
 
-#define UDP_PACKET_SZ_BYTES 64
+#define UDP_PACKET_SZ_BYTES 128
 
 // __declspec(shared ctm) is one copy shared by all threads in an ME, in CTM
 // __declspec(shared export ctm) is one copy shared by all MEs in an island in CTM (CTM default scope for 'export' of island)
@@ -99,6 +99,7 @@ struct ring_meta {
 __declspec(shared export mem) volatile uint32_t start = 0;
 __declspec(shared mem) volatile uint64_t tx_buf_start;
 __declspec(shared mem) volatile struct ring_meta tx_meta;
+// __declspec(shared mem) volatile uint64_t pack_buf_imem[32];
 
 /*
  * Fill out all the common parts of the DMA command structure, plus
@@ -153,10 +154,13 @@ void dma_packet_recv(__mem40 void *addr, uint8_t dma_len) {
     __xwrite struct nfp_pcie_dma_cmd dma_cmd_rd;
     SIGNAL cmpl_sig, enq_sig;
 
+    if (dma_len == 0) {
+        return;
+    }
     pcie_dma_setup(&dma_cmd,
         __signal_number(&cmpl_sig),
         dma_len,
-        (uint32_t)((unsigned long long)addr >> 32), addr);
+        (uint32_t)((uint64_t)addr >> 32), (uint32_t)((uint64_t)addr & 0xffffffff));
 
     dma_cmd.pcie_addr_hi = tx_meta.head >> 32;
     dma_cmd.pcie_addr_lo = tx_meta.head & 0xffffffff;
@@ -164,6 +168,7 @@ void dma_packet_recv(__mem40 void *addr, uint8_t dma_len) {
     dma_cmd_rd = dma_cmd;
     __pcie_dma_enq(0, &dma_cmd_rd, NFP_PCIE_DMA_FROMPCI_HI,
                      sig_done, &enq_sig);
+
     wait_for_all(&cmpl_sig, &enq_sig);
 
     tx_meta.head += dma_len;
@@ -172,62 +177,40 @@ void dma_packet_recv(__mem40 void *addr, uint8_t dma_len) {
     }
 }
 
-static void build_tx_meta(__imem struct nbi_meta_catamaran *nbi_meta)
-{
-    __xread blm_buf_handle_t buf;
-    int pkt_num;
-    int blq = 0;
-
-    // reg_zero(nbi_meta->__raw, sizeof(struct nbi_meta_catamaran));
-
-    /*
-     * Poll for a CTM buffer until one is returned
-     */
-    while (1) {
-        pkt_num = pkt_ctm_alloc(&ctm_credits_2, __ISLAND, PKT_CTM_SIZE_256, 1, 0);
-        if (pkt_num != CTM_ALLOC_ERR)
-            break;
-        sleep(1000);
-        mem_incr64((__mem void *) gen_pkt_ctm_wait);
-    }
-    /*
-     * Poll for MU buffer until one is returned.
-     */
-    while (blm_buf_alloc(&buf, blq) != 0) {
-        sleep(1000);
-        mem_incr64((__mem void *) gen_pkt_blm_wait);
-    }
-
-    nbi_meta->pkt_info.isl = __ISLAND;
-    nbi_meta->pkt_info.pnum = pkt_num;
-    nbi_meta->pkt_info.bls = blq;
-    nbi_meta->pkt_info.muptr = buf;
-
-    /* all other fields in the nbi_meta struct are left zero */
-}
-
 int main(void)
 {
     int pkt_num, pkt_off;
     __xread blm_buf_handle_t buf;
     int blq = 0, i, q_dst;
     __mem40 char *pbuf;
+    uint64_t curr_tx_head;
+    uint64_t curr_tx_tail;
 
     // Required for packet sending.
     __gpr struct pkt_ms_info msi_gen;
     __imem struct nbi_meta_catamaran nbi_meta_gen;
 
+    // Required to save two part DMA lengths.
+    uint8_t two_part_dma_first_len = 0;
+    uint8_t two_part_dma_second_len = 0;
+
     if (ctx() != 0) {
         return 0;
     }
 
-    while (start != 1) {
+    tx_meta.head = 0;
+    tx_meta.tail = 0;
+    tx_meta.len = 0;
+
+    // Piyush's hack. Use check on start instead of this check.
+    while (tx_meta.head == 0 || tx_meta.tail == 0 || tx_meta.len == 0) {
     }
+
+    //while (start != 1) {
+    //}
 
     tx_buf_start = tx_meta.head;
     pkt_off = PKT_NBI_OFFSET + MAC_PREPEND_BYTES;
-
-    DEBUG(0x1234567, 0x1234567, 0x1234567, 0x1234567);
 
     for (;;) {
         // Allocate a packet
@@ -236,11 +219,11 @@ int main(void)
          * Poll for a CTM buffer until one is returned
          */
         while (1) {
-            pkt_num = pkt_ctm_alloc(&ctm_credits_2, __ISLAND, PKT_CTM_SIZE_256, 1, 0);
+            pkt_num = pkt_ctm_alloc(&ctm_credits_2, __ISLAND, PKT_CTM_SIZE_256, 1, 1);
             if (pkt_num != CTM_ALLOC_ERR)
                 break;
             sleep(1000);
-            mem_incr64((__mem void *) gen_pkt_ctm_wait);
+            // mem_incr64((__mem void *) gen_pkt_ctm_wait);
         }
 
         /*
@@ -253,14 +236,16 @@ int main(void)
 
         pbuf   = pkt_ctm_ptr40(__ISLAND, pkt_num, 0);
 
-        DEBUG_MEM(pbuf, 256);
 
         // Prepare the metadata in the CTM buffer
         nbi_meta_gen.pkt_info.isl = __ISLAND;
         nbi_meta_gen.pkt_info.pnum = pkt_num;
+
         nbi_meta_gen.pkt_info.bls = blq;
         nbi_meta_gen.pkt_info.muptr = buf;
-        nbi_meta_gen.pkt_info.len = 8 + UDP_PACKET_SZ_BYTES;
+        nbi_meta_gen.pkt_info.split = 1;
+
+        nbi_meta_gen.pkt_info.len = 4 + UDP_PACKET_SZ_BYTES;
         nbi_meta_gen.port = 3; // Correct?
 
         for (i=0; i<sizeof(struct nbi_meta_catamaran); i++) {
@@ -268,40 +253,47 @@ int main(void)
         }
 
         while (1) {
-
+            curr_tx_tail = tx_meta.tail;
             // Now check for a packet in TX ring and send.
-            if (tx_meta.head < tx_meta.tail) {
-                if (tx_meta.tail - tx_meta.head >= UDP_PACKET_SZ_BYTES) {
+            if (tx_meta.head < curr_tx_tail) {
+                if (curr_tx_tail - tx_meta.head >= UDP_PACKET_SZ_BYTES) {
                     // Can DMA
                     // 76 bytes assuming 40 bytes of padding and 12 bytes of MAC prepend. Look out for this while testing.
-                    dma_packet_recv(pbuf+pkt_off+4, UDP_PACKET_SZ_BYTES);
+                    dma_packet_recv(pbuf+pkt_off, UDP_PACKET_SZ_BYTES);
                     break;
                 }
             } else {
-                if (tx_meta.head == tx_meta.tail) {
+                if (tx_meta.head == curr_tx_tail) {
                     // TODO - This can happen only when TXing the first packet. Post
-                    // that, the user driver will alawys ensure tail is never equal to head. So, optimize this check?
+                    // that, the user driver will always ensure tail is never equal to head. So, optimize this check?
                 } else {
-                    if (((tx_buf_start + tx_meta.len) - tx_meta.head) + (tx_meta.tail - tx_buf_start) >= UDP_PACKET_SZ_BYTES) {
+                    two_part_dma_first_len = (tx_buf_start + tx_meta.len) - tx_meta.head;
+                    two_part_dma_second_len = curr_tx_tail - tx_buf_start;
+
+                    if (two_part_dma_first_len >= UDP_PACKET_SZ_BYTES) {
+                        // Can DMA in 1 part
+                        dma_packet_recv(pbuf+pkt_off, UDP_PACKET_SZ_BYTES);
+                        break;
+                    }
+                    if (two_part_dma_first_len + two_part_dma_second_len >= UDP_PACKET_SZ_BYTES) {
                         // Can DMA in 2 parts
-                        dma_packet_recv(pbuf+pkt_off+4, (tx_buf_start + tx_meta.len) - tx_meta.head);
-                        dma_packet_recv(pbuf+pkt_off+4+(tx_buf_start + tx_meta.len) - tx_meta.head,
-                            UDP_PACKET_SZ_BYTES - ((tx_buf_start + tx_meta.len) - tx_meta.head));
+                        dma_packet_recv(pbuf+pkt_off, two_part_dma_first_len);
+                        dma_packet_recv(pbuf+pkt_off+two_part_dma_first_len,
+                            UDP_PACKET_SZ_BYTES - two_part_dma_first_len);
                         break;
                     }
                 }
             }
         }
 
-        DEBUG_MEM(pbuf, 256);
         q_dst  = PORT_TO_CHANNEL(nbi_meta_gen.port);
-        pkt_mac_egress_cmd_write(pbuf, pkt_off, 0, 0); // Write data to make the packet MAC egress generate L3 and L4 checksums
+        pkt_mac_egress_cmd_write(pbuf, pkt_off, 1, 1); // Write data to make the packet MAC egress generate L3 and L4 checksums
 
-        msi_gen = pkt_msd_write(pbuf, pkt_off); // Write a packet modification script of NULL
+        msi_gen = pkt_msd_write(pbuf, pkt_off - 4); // Write a packet modification script of NULL
         pkt_nbi_send(__ISLAND,
                      pkt_num,
                      &msi_gen,
-                     UDP_PACKET_SZ_BYTES,
+                     UDP_PACKET_SZ_BYTES + 4,
                      NBI,
                      q_dst,
                      nbi_meta_gen.seqr,
